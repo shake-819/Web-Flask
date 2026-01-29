@@ -13,12 +13,46 @@ import json  # ← 追加
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
-app.secret_key = "supersecret"  # 本番ではos.urandom(32)などに変更推奨
+app.secret_key = "supersecret"
 sessions = {}
 
-# FlareSolverr設定（ここをあなたのRender URLに合わせる）
+# ----------------- FlareSolverr設定 -----------------
 FLARESOLVERR_URL = "https://flaresolverr-latest-nrsp.onrender.com/v1"
-FLARESOLVERR_TIMEOUT = 90  # 秒（Turnstile系は長めに）
+
+def solve_with_flaresolverr(session: requests.Session, target_url: str, max_timeout=60000) -> dict | None:
+    """
+    FlareSolverrを使ってCloudflareを突破し、cookiesとuserAgentを返す
+    失敗したらNone
+    """
+    payload = {
+        "cmd": "request.get",
+        "url": target_url,
+        "maxTimeout": max_timeout,
+    }
+
+    try:
+        resp = requests.post(
+            FLARESOLVERR_URL,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=90
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("status") != "ok":
+            print(f"FlareSolverr error: {data.get('message')}")
+            return None
+
+        solution = data["solution"]
+        return {
+            "cookies": {c["name"]: c["value"] for c in solution.get("cookies", [])},
+            "user-agent": solution.get("userAgent", ""),
+        }
+
+    except Exception as e:
+        print(f"FlareSolverr request failed: {e}")
+        return None
 
 # ----------------- ヘルパ -----------------
 def get_user_session():
@@ -57,10 +91,10 @@ def normalize_input_url(u: str) -> str:
     if not u:
         return ""
     u = u.strip()
-    u = WS_RE.sub(" ", u).strip().strip('\'"')
+    u = WS_RE.sub(" ", u).strip().strip('"')
     if u.startswith("//"):
         u = "https:" + u
-    if not re.match(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://', u):
+    if not re.match(r'^[a-zA-Z][a-zA-Z0-9+-.]*://', u):
         u = "https://" + u.lstrip("/")
     u = SCHEME_FIX_RE.sub(r'\1://', u)
     pu = urlparse(u)
@@ -76,13 +110,14 @@ def normalize_input_url(u: str) -> str:
 def abs_url(base, val):
     if not val or isinstance(val, bytes) or str(val).startswith("data:"):
         return val
-    v = str(val).strip().strip('"\'')
+    v = str(val).strip().strip('"')
     if v.startswith("//"):
         v = "https:" + v
     if re.match(r'^(javascript:|mailto:|tel:|#)', v, re.IGNORECASE):
         return v
     return urljoin(base, v)
 
+# ----------------- 正確な /go?url= 変換 -----------------
 def make_proxy_url(url, base):
     if not url:
         return url
@@ -96,8 +131,8 @@ def make_proxy_url(url, base):
 def stream_response(origin_resp):
     headers = {}
     for h in [
-        "Content-Type", "Content-Length", "Content-Range", "Accept-Ranges",
-        "ETag", "Last-Modified", "Cache-Control", "Content-Disposition"
+            "Content-Type", "Content-Length", "Content-Range", "Accept-Ranges",
+            "ETag", "Last-Modified", "Cache-Control", "Content-Disposition"
     ]:
         if h in origin_resp.headers:
             headers[h] = origin_resp.headers[h]
@@ -116,60 +151,27 @@ def stream_response(origin_resp):
                     status=origin_resp.status_code,
                     headers=headers)
 
-# ----------------- FlareSolverr経由でHTMLを取得 -----------------
-def get_via_flaresolverr(target_url, user_session):
-    payload = {
-        "cmd": "request.get",
-        "url": target_url,
-        "maxTimeout": FLARESOLVERR_TIMEOUT * 1000,  # ミリ秒
-        "returnOnlyCookies": False,
-    }
-    try:
-        fs_resp = requests.post(FLARESOLVERR_URL, json=payload, timeout=FLARESOLVERR_TIMEOUT + 10)
-        fs_resp.raise_for_status()
-        solution = fs_resp.json()
-
-        if solution.get("status") != "ok":
-            raise Exception(f"FlareSolverr failed: {solution.get('message', '不明なエラー')}")
-
-        html = solution["solution"]["response"]
-        cookies = solution["solution"].get("cookies", [])
-
-        # cookiesをuser_sessionに反映（.ts / m3u8などで必要）
-        parsed = urlparse(target_url)
-        domain = parsed.netloc
-        for cookie in cookies:
-            user_session.cookies.set(
-                cookie.get("name"),
-                cookie.get("value"),
-                domain=domain,
-                path=cookie.get("path", "/"),
-                secure=cookie.get("secure", False),
-                expires=cookie.get("expiry", None)
-            )
-
-        status_code = solution["solution"].get("status", 200)
-        return html, status_code
-
-    except Exception as e:
-        return f"FlareSolverrエラー: {str(e)}", 503
-
 # ----------------- HTML 書き換え高速化 -----------------
 def rewrite_html_urls(soup, base_url):
     tags_attrs = {
-        "img": ["src", "data-src", "data-lazy-src", "data-original", "data-image", "data-file", "data-thumb", "srcset", "data-srcset"],
+        "img": [
+            "src", "data-src", "data-lazy-src", "data-original", "data-image",
+            "data-file", "data-thumb", "srcset", "data-srcset"
+        ],
         "iframe": ["src"],
         "form": ["action"]
     }
 
     def process_tag(t, tag, attr_list):
         if tag == "img":
-            for lazy_attr in ["data-src", "data-lazy-src", "data-original", "data-image", "data-file", "data-thumb"]:
+            for lazy_attr in [
+                    "data-src", "data-lazy-src", "data-original", "data-image",
+                    "data-file", "data-thumb"
+            ]:
                 if t.has_attr(lazy_attr):
                     t["src"] = make_proxy_url(t.get(lazy_attr), base_url)
             if t.has_attr("loading"):
                 del t["loading"]
-
         if t.has_attr("srcset") or t.has_attr("data-srcset"):
             attr_name = "srcset" if t.has_attr("srcset") else "data-srcset"
             srcset_val = t.get(attr_name)
@@ -181,17 +183,20 @@ def rewrite_html_urls(soup, base_url):
                         parts[0] = make_proxy_url(parts[0], base_url)
                         new_srcset.append(" ".join(parts))
                 t[attr_name] = ", ".join(new_srcset)
-
         for attr in attr_list:
             if t.has_attr(attr):
                 t[attr] = make_proxy_url(t.get(attr), base_url)
-
         if tag == "form":
             if not t.get("method"):
                 t["method"] = "GET"
             act = t.get("action") or base_url
             t["action"] = "/go"
-            hidden = soup.new_tag("input", attrs={"type": "hidden", "name": "url", "value": make_proxy_url(act, base_url)})
+            hidden = soup.new_tag("input",
+                                  attrs={
+                                      "type": "hidden",
+                                      "name": "url",
+                                      "value": make_proxy_url(act, base_url)
+                                  })
             t.append(hidden)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -201,16 +206,16 @@ def rewrite_html_urls(soup, base_url):
                 futures.append(executor.submit(process_tag, t, tag, attr_list))
         concurrent.futures.wait(futures)
 
-    # style内のurl()書き換え
-    bg_url_pattern = re.compile(r'url\(([^)]+)\)')
+    # style 内の url() 書き換え
+    bg_url_pattern = re.compile(r'url\(["\']?([^"\')]+)["\']?\)')
     for elem in soup.find_all(style=True):
         style_val = elem.get("style", "")
         def repl(m):
-            raw = m.group(1).strip("\"'")
-            return f"url({make_proxy_url(raw, base_url)})"
+            raw = m.group(1).strip('"\'')
+            return f'url({make_proxy_url(raw, base_url)})'
         elem["style"] = bg_url_pattern.sub(repl, style_val)
 
-    # img最大化スタイル
+    # 全体 img 最大化
     style_tag = soup.new_tag("style")
     style_tag.string = "img{max-width:100%;height:auto;}"
     if soup.head:
@@ -231,7 +236,7 @@ REAL_CHROME_UA = (
 @app.route("/<path:path>", methods=["GET", "POST", "HEAD"])
 def proxy(path):
     if not path:
-        return '''
+        return '''\
         <h2>URLを入力してください</h2>
         <form action="/go" method="get" style="margin:1rem 0;">
           <input name="url" placeholder="https://example.com" size="50" />
@@ -249,6 +254,7 @@ def proxy(path):
     target_url = urlunparse(parsed_path)
 
     user_session = get_user_session()
+
     headers = {
         "User-Agent": REAL_CHROME_UA,
         "Referer": target_url,
@@ -258,16 +264,57 @@ def proxy(path):
     }
 
     try:
-        # HTMLの場合のみFlareSolverrを使う
-        content_type_guess = mimetypes.guess_type(target_url)[0] or ""
-        if "html" in content_type_guess.lower() or target_url.lower().endswith((".html", ".htm", "/")):
-            html, status_code = get_via_flaresolverr(target_url, user_session)
-            if isinstance(html, str) and "FlareSolverrエラー" in html:
-                return html, status_code
+        # 1回目の通常リクエスト
+        resp = user_session.get(
+            target_url,
+            headers=headers,
+            timeout=20,
+            verify=False,
+            allow_redirects=True,
+        )
 
+        # Cloudflare検知（簡易判定）
+        is_cloudflare = False
+        if resp.status_code in (403, 429, 503):
+            is_cloudflare = True
+        elif "cf-ray" in resp.headers or "cloudflare" in resp.text.lower():
+            is_cloudflare = True
+
+        if is_cloudflare:
+            print(f"Cloudflare detected → trying FlareSolverr for {target_url}")
+            solution = solve_with_flaresolverr(user_session, target_url)
+            if solution:
+                # cookiesをセッションにセット
+                domain = urlparse(target_url).netloc
+                for name, value in solution["cookies"].items():
+                    user_session.cookies.set(name, value, domain=domain)
+
+                # User-Agent更新（必要に応じて）
+                if solution["user-agent"]:
+                    headers["User-Agent"] = solution["user-agent"]
+                    user_session.headers.update({"User-Agent": solution["user-agent"]})
+
+                # 2回目のリクエスト（突破狙い）
+                resp = user_session.get(
+                    target_url,
+                    headers=headers,
+                    timeout=25,
+                    verify=False,
+                    allow_redirects=True,
+                )
+            else:
+                return "<h1>FlareSolverrでも突破できませんでした（公開インスタンスが不安定かも）</h1>", 503
+
+        content_type = resp.headers.get("Content-Type", "") or ""
+        mime_hint = mimetypes.guess_type(target_url)[0]
+
+        # HTML処理
+        if "text/html" in content_type or mime_hint == "text/html":
+            encoding = detect_encoding(resp)
+            html = resp.content.decode(encoding, errors="replace")
             soup = BeautifulSoup(html, "html.parser")
 
-            # lazyload対応
+            # lazyload対応など（元の処理を維持）
             for img in soup.find_all("img"):
                 for attr in ["data-src", "data-original", "data-lazy", "data-url", "data-img"]:
                     if img.get(attr) and not img.get("src"):
@@ -277,7 +324,6 @@ def proxy(path):
                 if img.get("loading"):
                     del img["loading"]
 
-            # video/source/poster
             for video in soup.find_all("video"):
                 if video.get("src"):
                     video["src"] = make_proxy_url(abs_url(target_url, video["src"]), target_url)
@@ -288,7 +334,6 @@ def proxy(path):
                 if source.get("src"):
                     source["src"] = make_proxy_url(abs_url(target_url, source["src"]), target_url)
 
-            # CSSインライン
             for link in soup.find_all("link", rel=lambda v: v and "stylesheet" in v):
                 href = link.get("href")
                 if not href:
@@ -306,9 +351,7 @@ def proxy(path):
             soup = rewrite_html_urls(soup, target_url)
             return Response(str(soup), content_type="text/html; charset=utf-8")
 
-        # m3u8処理（cookiesがFlareSolverrから入ってるので通る可能性↑）
-        resp = user_session.get(target_url, headers=headers, timeout=20, verify=False, allow_redirects=True)
-        content_type = resp.headers.get("Content-Type", "") or ""
+        # m3u8処理（省略せず維持）
         if (
             "application/vnd.apple.mpegurl" in content_type.lower()
             or target_url.lower().endswith(".m3u8")
@@ -327,10 +370,15 @@ def proxy(path):
                     full_url = urljoin(target_url, line)
                     proxied = make_proxy_url(full_url, target_url)
                 lines.append(proxied)
-            return Response("\n".join(lines) + "\n", content_type="application/vnd.apple.mpegurl; charset=utf-8")
+            return Response(
+                "\n".join(lines) + "\n",
+                content_type="application/vnd.apple.mpegurl; charset=utf-8"
+            )
 
-        # その他のリソース（動画含む）
+        # バイナリ/動画などストリーム
         video_exts = (".mp4", ".m4s", ".ts", ".m3u8", ".key", ".vtt", ".webm", ".m4a")
+        is_video_resource = any(target_url.lower().endswith(ext) for ext in video_exts)
+
         resource_headers = {
             "User-Agent": REAL_CHROME_UA,
             "Accept": "*/*",
@@ -338,6 +386,7 @@ def proxy(path):
             "Referer": f"{parsed_path.scheme}://{parsed_path.netloc}/",
             "Origin": f"{parsed_path.scheme}://{parsed_path.netloc}",
         }
+
         if "Range" in request.headers:
             resource_headers["Range"] = request.headers["Range"]
         if request.headers.get("Cookie"):
@@ -345,7 +394,8 @@ def proxy(path):
 
         method = request.method if request.method != "HEAD" else "GET"
         r = user_session.request(
-            method, target_url,
+            method,
+            target_url,
             headers=resource_headers,
             stream=True,
             timeout=30,
@@ -353,8 +403,17 @@ def proxy(path):
             allow_redirects=True,
         )
 
-        excluded_headers = {"content-encoding", "transfer-encoding", "connection", "content-security-policy", "strict-transport-security"}
-        response_headers = [(k, v) for k, v in r.headers.items() if k.lower() not in excluded_headers]
+        excluded_headers = {
+            "content-encoding",
+            "transfer-encoding",
+            "connection",
+            "content-security-policy",
+            "strict-transport-security",
+        }
+        response_headers = [
+            (k, v) for k, v in r.headers.items()
+            if k.lower() not in excluded_headers
+        ]
 
         if not any(h[0].lower() == "content-type" for h in response_headers):
             guessed = mimetypes.guess_type(target_url)[0]
@@ -366,7 +425,12 @@ def proxy(path):
                 if chunk:
                     yield chunk
 
-        return Response(generate(), status=r.status_code, headers=response_headers, direct_passthrough=True)
+        return Response(
+            generate(),
+            status=r.status_code,
+            headers=response_headers,
+            direct_passthrough=True,
+        )
 
     except Exception as e:
         return f"<h1>エラー</h1><pre>{str(e)}</pre>", 500
@@ -380,6 +444,4 @@ def redirect_form():
     return proxy(url)
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 3000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=3000)
